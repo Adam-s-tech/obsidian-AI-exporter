@@ -9,12 +9,10 @@ import type {
   ExtractionResult,
   ValidationResult,
   ConversationMessage,
-  ConversationMetadata,
   DeepResearchLinks,
   DeepResearchSource,
 } from '../../lib/types';
 import { extractErrorMessage } from '../../lib/error-utils';
-import { generateHash } from '../../lib/hash';
 import { sanitizeHtml } from '../../lib/sanitize';
 import {
   ALL_PLATFORM_LABELS,
@@ -22,15 +20,16 @@ import {
   MAX_DEEP_RESEARCH_TITLE_LENGTH,
   PLATFORM_LABELS,
 } from '../../lib/constants';
+import { accumulateWhileScrolling, type HarvestEntry } from '../../lib/scroll-accumulate';
 import {
-  accumulateWhileScrolling,
   describeScrollStop,
   resolveScrollDeadlines,
   DEFAULT_SCROLL_DEADLINES,
-  type HarvestEntry,
   type ScrollDeadlines,
-} from '../../lib/scroll-manager';
+} from '../../lib/scroll-deadlines';
 import { platformForHost } from '../../lib/platform-registry';
+import { buildMetadata, validateExtraction } from './extraction-result';
+import { buildDeepResearchExtraction } from './deep-research-result';
 
 /**
  * Per-platform configuration for accumulating a virtualized conversation
@@ -48,6 +47,16 @@ export interface ScrollConfig {
    * platforms that load older turns only once the top is reached (ADR-042).
    */
   readonly topSettleMs?: number;
+}
+
+/** What {@link BaseExtractor.collectMessages} hands back to the template method. */
+export interface CollectedMessages {
+  messages: ConversationMessage[];
+  warning?: string;
+  /** The pass ended on a deadline, so earlier messages may be missing (#449). */
+  truncated?: boolean;
+  /** Ordinal of the newest turn covered, when the platform has one (#465). */
+  watermark?: number;
 }
 
 /**
@@ -101,10 +110,10 @@ export abstract class BaseExtractor implements IConversationExtractor {
   /**
    * Main extraction method (template method pattern)
    *
-   * Subclasses customize behavior via tryExtractDeepResearch() to intercept
-   * for Deep Research mode. Platforms that need pre/post processing around
-   * the normal flow (e.g. Gemini's auto-scroll + warning) override extract()
-   * directly.
+   * Subclasses customize behavior through the hooks below — never by
+   * overriding extract() itself, which test/arch/extractor-extract-hook.test.ts
+   * enforces (ADR-043): a copy of this method silently misses every later fix
+   * to it, as Gemini's did with the truncated flag (DES-018 H-1).
    */
   async extract(): Promise<ExtractionResult> {
     try {
@@ -193,7 +202,7 @@ export abstract class BaseExtractor implements IConversationExtractor {
   /**
    * Hook: auto-scroll configuration for virtualized platforms (ADR-017).
    * Return null (default) for platforms that render all turns eagerly or that
-   * handle scrolling in their own extract() override (Gemini).
+   * run their own scroll engine in a collectMessages() override (Gemini).
    */
   protected getScrollConfig(): ScrollConfig | null {
     return null;
@@ -204,14 +213,7 @@ export abstract class BaseExtractor implements IConversationExtractor {
    * virtualized and the user enabled auto-scroll. Falls back to a single-pass
    * extractMessages() when disabled, unconfigured, or the container is missing.
    */
-  protected async collectMessages(): Promise<{
-    messages: ConversationMessage[];
-    warning?: string;
-    /** The pass ended on a deadline, so earlier messages may be missing (#449). */
-    truncated?: boolean;
-    /** Ordinal of the newest turn covered, when the platform has one (#465). */
-    watermark?: number;
-  }> {
+  protected async collectMessages(): Promise<CollectedMessages> {
     const config = this.getScrollConfig();
     if (!this.enableAutoScroll || !config) {
       return { messages: this.extractMessages(), watermark: this.currentWatermark() };
@@ -288,50 +290,19 @@ export abstract class BaseExtractor implements IConversationExtractor {
 
   /**
    * Build a Deep Research extraction result.
-   * Shared logic for Claude and Gemini Deep Research modes.
+   * Shared logic for Claude and Gemini Deep Research modes: the hooks below
+   * read the platform's panel, buildDeepResearchExtraction() assembles it.
    * Subclasses override getDeepResearchSelectors() and extractSourceList()
    * for platform-specific DOM access.
    */
   protected buildDeepResearchResult(): ExtractionResult {
-    const title = this.getDeepResearchTitle();
-    const content = this.extractDeepResearchContent();
-
-    if (!content) {
-      return {
-        success: false,
-        error: 'Deep Research content not found',
-        warnings: ['Panel is visible but content element is empty or missing'],
-      };
-    }
-
-    const titleHash = generateHash(title);
-    const conversationId = `deep-research-${titleHash}`;
-    const links = this.extractDeepResearchLinks();
-
-    const messages = [
-      {
-        id: 'report-0',
-        role: 'assistant' as const,
-        content,
-        htmlContent: content,
-        index: 0,
-      },
-    ];
-
-    return {
-      success: true,
-      data: {
-        id: conversationId,
-        title,
-        url: window.location.href,
-        source: this.platform,
-        type: 'deep-research',
-        links,
-        messages,
-        extractedAt: new Date(),
-        metadata: this.buildMetadata(messages),
-      },
-    };
+    return buildDeepResearchExtraction({
+      title: this.getDeepResearchTitle(),
+      content: this.extractDeepResearchContent(),
+      links: this.extractDeepResearchLinks(),
+      source: this.platform,
+      url: window.location.href,
+    });
   }
 
   /**
@@ -387,18 +358,6 @@ export abstract class BaseExtractor implements IConversationExtractor {
     return [];
   }
 
-  /**
-   * Hostname of a URL, or 'unknown' when the URL cannot be parsed.
-   * Shared fallback for Deep Research source domain extraction.
-   */
-  protected extractDomain(url: string): string {
-    try {
-      return new URL(url).hostname;
-    } catch {
-      return 'unknown';
-    }
-  }
-
   // ========== DOM Sort & Message Build Utilities ==========
 
   /**
@@ -447,65 +406,7 @@ export abstract class BaseExtractor implements IConversationExtractor {
    * Validate extraction result quality
    */
   validate(result: ExtractionResult): ValidationResult {
-    const warnings: string[] = [];
-    const errors: string[] = [];
-
-    if (!result.success) {
-      errors.push(result.error || 'Extraction failed');
-      return { isValid: false, warnings, errors };
-    }
-
-    if (!result.data) {
-      errors.push('No data extracted');
-      return { isValid: false, warnings, errors };
-    }
-
-    const { messages, type, metadata } = result.data;
-    const isDeepResearch = type === 'deep-research';
-
-    if (messages.length === 0) {
-      errors.push('No messages found in conversation');
-    }
-
-    // Deep Research reports have only 1 message (the report itself), so skip this warning
-    if (messages.length < 2 && !isDeepResearch) {
-      warnings.push('Very few messages extracted - selectors may need updating');
-    }
-
-    // Check for balanced conversation (roughly equal user/assistant messages)
-    // Skip for Deep Research which only has assistant content
-    if (
-      !isDeepResearch &&
-      Math.abs(metadata.userMessageCount - metadata.assistantMessageCount) > 1
-    ) {
-      warnings.push('Unbalanced message count - some messages may not have been extracted');
-    }
-
-    // Check for empty content
-    const emptyMessages = messages.filter(m => !m.content.trim());
-    if (emptyMessages.length > 0) {
-      warnings.push(`${emptyMessages.length} message(s) have empty content`);
-    }
-
-    return {
-      isValid: errors.length === 0,
-      warnings,
-      errors,
-    };
-  }
-
-  /**
-   * Build metadata from extracted messages
-   */
-  protected buildMetadata(messages: ConversationMessage[]): ConversationMetadata {
-    const userMessageCount = messages.filter(m => m.role === 'user').length;
-    const assistantMessageCount = messages.filter(m => m.role === 'assistant').length;
-    return {
-      messageCount: messages.length,
-      userMessageCount,
-      assistantMessageCount,
-      hasCodeBlocks: messages.some(m => m.content.includes('<code') || m.content.includes('```')),
-    };
+    return validateExtraction(result);
   }
 
   /**
@@ -527,7 +428,7 @@ export abstract class BaseExtractor implements IConversationExtractor {
     }
 
     const warnings: string[] = [];
-    const metadata = this.buildMetadata(messages);
+    const metadata = buildMetadata(messages);
 
     if (metadata.userMessageCount === 0) {
       warnings.push('No user messages found');

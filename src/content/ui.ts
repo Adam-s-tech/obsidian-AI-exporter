@@ -11,6 +11,12 @@ import {
 } from '../lib/constants';
 import { getMessage } from '../lib/i18n';
 
+/**
+ * Slide-in/out animation length. The exit removes the toast after exactly this
+ * long, so the CSS duration and the removal delay must come from one value.
+ */
+const TOAST_ANIMATION_MS = 300;
+
 // CSS styles for UI components
 const STYLES = `
   #g2o-sync-anchor {
@@ -83,7 +89,7 @@ const STYLES = `
     font-size: 14px;
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
     box-shadow: 0 4px 16px rgba(0,0,0,0.15);
-    animation: g2o-slideIn 0.3s ease;
+    animation: g2o-slideIn ${TOAST_ANIMATION_MS}ms ease;
     max-width: 400px;
   }
 
@@ -346,6 +352,48 @@ const TOAST_ICONS: Record<ToastType, string> = {
   info: 'ℹ️',
 };
 
+/** Remove a toast, and forget it if it is still the current one. */
+function dismissToast(toast: HTMLElement): void {
+  toast.remove();
+  if (currentToast === toast) {
+    currentToast = null;
+  }
+}
+
+/** The toast element: icon, message (as text, never HTML) and a close button. */
+function buildToast(message: string, type: ToastType): HTMLDivElement {
+  const toast = document.createElement('div');
+  toast.className = `g2o-toast ${type}`;
+
+  const toastIcon = document.createElement('span');
+  toastIcon.className = 'icon';
+  toastIcon.textContent = TOAST_ICONS[type];
+
+  const toastMessage = document.createElement('span');
+  toastMessage.className = 'message';
+  toastMessage.textContent = message;
+
+  const closeBtn = document.createElement('button');
+  closeBtn.className = 'close';
+  closeBtn.setAttribute('aria-label', 'Close');
+  closeBtn.textContent = '\u00d7';
+  closeBtn.addEventListener('click', () => dismissToast(toast));
+
+  toast.appendChild(toastIcon);
+  toast.appendChild(toastMessage);
+  toast.appendChild(closeBtn);
+  return toast;
+}
+
+/** Play the exit animation after `duration`, then remove the toast. */
+function scheduleAutoDismiss(toast: HTMLElement, duration: number): void {
+  setTimeout(() => {
+    if (currentToast !== toast) return;
+    toast.style.animation = `g2o-slideIn ${TOAST_ANIMATION_MS}ms ease reverse`;
+    setTimeout(() => dismissToast(toast), TOAST_ANIMATION_MS);
+  }, duration);
+}
+
 /**
  * Show a toast notification
  */
@@ -362,47 +410,12 @@ export function showToast(
     currentToast = null;
   }
 
-  const toast = document.createElement('div');
-  toast.className = `g2o-toast ${type}`;
+  const toast = buildToast(message, type);
   currentToast = toast;
-
-  const toastIcon = document.createElement('span');
-  toastIcon.className = 'icon';
-  toastIcon.textContent = TOAST_ICONS[type];
-
-  const toastMessage = document.createElement('span');
-  toastMessage.className = 'message';
-  toastMessage.textContent = message;
-
-  const closeBtn = document.createElement('button');
-  closeBtn.className = 'close';
-  closeBtn.setAttribute('aria-label', 'Close');
-  closeBtn.textContent = '\u00d7';
-  closeBtn.addEventListener('click', () => {
-    toast.remove();
-    if (currentToast === toast) {
-      currentToast = null;
-    }
-  });
-
-  toast.appendChild(toastIcon);
-  toast.appendChild(toastMessage);
-  toast.appendChild(closeBtn);
-
   document.body.appendChild(toast);
 
-  // Auto-dismiss
   if (duration > 0) {
-    setTimeout(() => {
-      if (currentToast !== toast) return;
-      toast.style.animation = 'g2o-slideIn 0.3s ease reverse';
-      setTimeout(() => {
-        toast.remove();
-        if (currentToast === toast) {
-          currentToast = null;
-        }
-      }, 300);
-    }, duration);
+    scheduleAutoDismiss(toast, duration);
   }
 }
 

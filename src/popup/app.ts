@@ -7,7 +7,7 @@
  * inside initPopup() rather than at module scope.
  */
 
-import { getSettings, saveSettings } from '../lib/storage';
+import { getSettingsOrThrow, saveSettings } from '../lib/storage';
 import type { ExtensionSettings, TemplateOptions, OutputOptions } from '../lib/types';
 import {
   validateCalloutType,
@@ -35,6 +35,7 @@ import {
   MIN_SCROLL_MAX_TIMEOUT_SEC,
   MAX_SCROLL_MAX_TIMEOUT_SEC,
 } from '../lib/constants';
+import { DEFAULT_SYNC_SETTINGS } from '../lib/settings-schema';
 import { getMessage } from '../lib/i18n';
 import { sendMessage } from '../lib/messaging';
 
@@ -145,11 +146,15 @@ export async function initPopup(): Promise<void> {
   elements = queryElements();
   try {
     initializeI18n();
-    const settings = await getSettings();
+    // Strict read: a form filled with defaults after a failed read would be
+    // saved back over the user's real settings (DES-018 M-2).
+    const settings = await getSettingsOrThrow();
     populateForm(settings);
     setupEventListeners();
     setupToggleSwitchAccessibility();
   } catch (error) {
+    elements.saveBtn.disabled = true;
+    elements.testBtn.disabled = true;
     showStatus(getMessage('toast_error_connectionFailed'), 'error');
     console.error('[G2O Popup] Init error:', error);
   }
@@ -462,7 +467,7 @@ function collectSettings(): ExtensionSettings {
     enableAppendMode: elements.enableAppendMode.checked,
     enableToolContent: elements.enableToolContent.checked,
     enableImageExport: elements.enableImageExport.checked,
-    imageVaultPath: elements.imageVaultPath.value.trim() || 'AI/{platform}/images',
+    imageVaultPath: elements.imageVaultPath.value.trim() || DEFAULT_SYNC_SETTINGS.imageVaultPath,
     flattenLargeCallouts: elements.flattenLargeCallouts.checked,
     maxCalloutLines: parseCalloutLines(elements.maxCalloutLines.value),
     ...collectLimits(),
